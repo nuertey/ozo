@@ -39,8 +39,12 @@ struct socket_mock {
 
     socket_mock(io_context& io) : io_(std::addressof(io)) {}
 
-    io_context& get_io_service() {
+    io_context& get_io_context() {
         return *io_;
+    }
+
+    auto get_executor() {
+        return get_io_context().get_executor();
     }
 
     void assign(std::shared_ptr<native_handle_mock> handle, ozo::error_code& ec) {

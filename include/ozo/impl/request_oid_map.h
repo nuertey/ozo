@@ -56,13 +56,10 @@ struct request_oid_map_op {
 
     template <typename Connection>
     void perform(Connection&& conn) {
-        async_request(
-            std::forward<Connection>(conn),
-            make_oids_query(get_oid_map(conn)),
-            time_traits::duration::max(),
-            std::back_inserter(*res_),
-            *this
-        );
+        const auto oid_map = get_oid_map(conn);
+        auto ctx = make_request_operation_context(std::forward<Connection>(conn), *this);
+        async_send_query_params(ctx, make_oids_query(oid_map));
+        async_get_result(std::move(ctx), async_request_out_handler{std::back_inserter(*res_)});
     }
 
     template <typename Connection>
@@ -78,22 +75,23 @@ struct request_oid_map_op {
 
     using executor_type = decltype(asio::get_associated_executor(handler_));
 
-    auto get_executor() const noexcept {
+    executor_type get_executor() const noexcept {
         return asio::get_associated_executor(handler_);
     }
 
-    template <typename Func>
-    friend void asio_handler_invoke(Func&& f, request_oid_map_op* ctx) {
-        using boost::asio::asio_handler_invoke;
-        asio_handler_invoke(std::forward<Func>(f), std::addressof(ctx->handler_));
+    using allocator_type = decltype(asio::get_associated_allocator(handler_));
+
+    allocator_type get_allocator() const noexcept {
+        return asio::get_associated_allocator(handler_);
     }
 };
 
 template <typename Handler>
 auto make_async_request_oid_map_op(Handler&& handler) {
+    auto allocator = asio::get_associated_allocator(handler);
     return request_oid_map_op<std::decay_t<Handler>> {
         std::forward<Handler>(handler),
-        std::make_shared<oids_result>()
+        std::allocate_shared<oids_result>(allocator)
     };
 }
 

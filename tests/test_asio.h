@@ -6,6 +6,7 @@
 #include <ozo/asio.h>
 
 #include <boost/asio/post.hpp>
+#include <boost/asio/executor.hpp>
 
 #include <gmock/gmock.h>
 
@@ -40,11 +41,13 @@ auto wrap_shared(Function&& f) {
     return shared_wrapper<std::decay_t<Function>> {std::make_shared<std::decay_t<Function>>(std::forward<Function>(f))};
 }
 
+struct io_context;
+
 struct executor {
     const executor_mock* impl = nullptr;
-    asio::execution_context* context_ = nullptr;
+    io_context* context_ = nullptr;
 
-    asio::execution_context& context() noexcept {
+    io_context& context() const noexcept {
         return *context_;
     }
 
@@ -74,26 +77,26 @@ struct executor {
 
 struct strand_executor_service_mock {
     virtual ~strand_executor_service_mock() = default;
-    virtual const executor_mock& get_executor() const = 0;
+    virtual executor_mock& get_executor() const = 0;
 };
 
 struct strand_executor_service_gmock : strand_executor_service_mock {
-    MOCK_CONST_METHOD0(get_executor, const executor_mock& ());
+    MOCK_CONST_METHOD0(get_executor, executor_mock& ());
 };
 
 struct io_context : asio::execution_context {
     using executor_type = executor;
 
     executor_type executor_;
-    const strand_executor_service_mock* strand_service_ = nullptr;
+    strand_executor_service_mock* strand_service_ = nullptr;
 
     io_context() = default;
 
     io_context(const executor_mock& executor)
-        : executor_ {&executor} {}
+        : executor_ {&executor, this} {}
 
-    io_context(const executor_mock& executor, const strand_executor_service_mock& strand_service)
-        : executor_ {&executor}, strand_service_(&strand_service) {}
+    io_context(const executor_mock& executor, strand_executor_service_mock& strand_service)
+        : executor_ {&executor, this}, strand_service_(&strand_service) {}
 
     auto get_executor() const noexcept {
         return executor_;
@@ -101,13 +104,13 @@ struct io_context : asio::execution_context {
 };
 
 struct strand {
-    const io_context& context_;
-    const executor_mock& executor_;
+    io_context& context_;
+    executor_mock& executor_;
 
-    explicit strand(const io_context& context)
+    explicit strand(io_context& context)
         : context_(context), executor_(context.strand_service_->get_executor()) {}
 
-    const io_context& context() const noexcept {
+    io_context& context() const noexcept {
         return context_;
     }
 
@@ -117,17 +120,17 @@ struct strand {
 
     template <typename Function, typename Allocator>
     void dispatch(Function&& f, Allocator) const {
-        return executor_.dispatch(std::forward<Function>(f));
+        return executor_.dispatch(wrap_shared(std::forward<Function>(f)));
     }
 
     template <typename Function, typename Allocator>
     void post(Function&& f, Allocator) const {
-        return executor_.post(std::forward<Function>(f));
+        return executor_.post(wrap_shared(std::forward<Function>(f)));
     }
 
     template <typename Function, typename Allocator>
     void defer(Function&& f, Allocator) const {
-        return executor_.defer(std::forward<Function>(f));
+        return executor_.defer(wrap_shared(std::forward<Function>(f)));
     }
 
     friend bool operator ==(const strand& lhs, const strand& rhs) {
@@ -178,7 +181,11 @@ struct stream_descriptor {
         mock_->close(ec);
     }
 
-    io_context& get_io_service() { return *io_;}
+    io_context& get_io_context() { return *io_;}
+
+    auto get_executor() {
+        return get_io_context().get_executor();
+    }
 };
 
 struct steady_timer_mock {
@@ -215,8 +222,18 @@ struct steady_timer {
 
 } // namespace tests
 
+namespace detail {
+
 template <>
-struct asio_strand<tests::io_context> { using type = tests::strand; };
+struct strand_executor<ozo::tests::executor> {
+    using type = ozo::tests::strand;
+
+    static auto get(const tests::executor& ex) {
+        return type{ex.context()};
+    }
+};
+
+} // namespace detail
 
 namespace tests {
 
@@ -231,26 +248,26 @@ struct callback_gmock;
 
 template <typename Arg1, typename Arg2>
 struct callback_gmock<Arg1, Arg2> {
-    using executor_type = executor;
+    using executor_type = boost::asio::executor;
 
     MOCK_CONST_METHOD3_T(call, void(ozo::error_code, Arg1, Arg2));
-    MOCK_CONST_METHOD0_T(get_executor, executor ());
+    MOCK_CONST_METHOD0_T(get_executor, executor_type ());
 };
 
 template <typename Arg>
 struct callback_gmock<Arg> {
-    using executor_type = executor;
+    using executor_type = boost::asio::executor;
 
     MOCK_CONST_METHOD2_T(call, void(ozo::error_code, Arg));
-    MOCK_CONST_METHOD0_T(get_executor, executor ());
+    MOCK_CONST_METHOD0_T(get_executor, executor_type ());
 };
 
 template <>
 struct callback_gmock<> {
-    using executor_type = executor;
+    using executor_type = boost::asio::executor;
 
     MOCK_CONST_METHOD1_T(call, void(ozo::error_code));
-    MOCK_CONST_METHOD0_T(get_executor, executor ());
+    MOCK_CONST_METHOD0_T(get_executor, executor_type ());
 };
 
 template <typename M>
