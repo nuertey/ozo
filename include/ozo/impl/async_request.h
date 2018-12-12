@@ -46,11 +46,6 @@ inline auto& get_connection(const request_operation_context_ptr<Ts...>& ctx) noe
 }
 
 template <typename ...Ts>
-inline decltype(auto) get_handler_context(const request_operation_context_ptr<Ts...>& ctx) noexcept {
-    return std::addressof(ctx->handler);
-}
-
-template <typename ...Ts>
 inline query_state get_query_state(const request_operation_context_ptr<Ts...>& ctx) noexcept {
     return ctx->state;
 }
@@ -73,29 +68,8 @@ inline void set_request_result(const request_operation_context_ptr<Ts...>& ctx,
 }
 
 template <typename ... Ts>
-auto& get_query(const request_operation_context_ptr<Ts ...>& context) noexcept {
-    return context->query;
-}
-
-template <typename ... Ts>
 auto& get_handler(const request_operation_context_ptr<Ts ...>& context) noexcept {
     return context->handler;
-}
-
-template <typename ... Ts>
-auto get_executor(const request_operation_context_ptr<Ts ...>& context) noexcept {
-    return asio::get_associated_executor(get_handler(context));
-}
-
-template <typename ... Ts>
-auto get_allocator(const request_operation_context_ptr<Ts ...>& context) noexcept {
-    return asio::get_associated_allocator(get_handler(context));
-}
-
-template <typename Oper, typename ...Ts>
-inline void post(const request_operation_context_ptr<Ts...>& ctx, Oper&& op) {
-    using asio::post;
-    post(get_executor(get_connection(ctx)), std::forward<Oper>(op));
 }
 
 template <typename ...Ts>
@@ -104,12 +78,12 @@ inline void done(const request_operation_context_ptr<Ts...>& ctx, error_code ec)
     decltype(auto) conn = get_connection(ctx);
     error_code _;
     get_socket(conn).cancel(_);
-    asio::post(detail::bind(std::move(get_handler(ctx)), std::move(ec), conn));
+    std::move(get_handler(ctx))(std::move(ec), conn);
 }
 
 template <typename ...Ts>
 inline void done(const request_operation_context_ptr<Ts...>& ctx) {
-    asio::post(detail::bind(std::move(get_handler(ctx)), error_code {}, get_connection(ctx)));
+    std::move(get_handler(ctx))(error_code {}, get_connection(ctx));
 }
 
 template <typename Continuation, typename ...Ts>
@@ -127,16 +101,20 @@ struct async_send_query_params_op {
     Context ctx_;
     BinaryQuery query_;
 
+    async_send_query_params_op(Context ctx, BinaryQuery query)
+    : ctx_(std::move(ctx)), query_(std::move(query)) {}
+
     void perform() {
         decltype(auto) conn = get_connection(ctx_);
         if (auto ec = set_nonblocking(conn)) {
             return done(ctx_, ec);
         }
-        //In the nonblocking state, calls to PQsendQuery, PQputline,
-        //PQputnbytes, PQputCopyData, and PQendcopy will not block
-        //but instead return an error if they need to be called again.
-        while (!send_query_params(conn, query_));
-        post(ctx_, *this);
+
+        if (!send_query_params(conn, query_)) {
+            return done(ctx_, error::pg_send_query_params_failed);
+        }
+
+        (*this)();
     }
 
     void operator () (error_code ec = error_code{}, std::size_t = 0) {
@@ -168,37 +146,32 @@ struct async_send_query_params_op {
         }
     }
 
-    using executor_type = std::decay_t<decltype(impl::get_executor(ctx_))>;
+    using executor_type = std::decay_t<decltype(asio::get_associated_executor(get_handler(ctx_)))>;
 
     executor_type get_executor() const noexcept {
-        return impl::get_executor(ctx_);
+        return asio::get_associated_executor(get_handler(ctx_));
     }
 
-    using allocator_type = std::decay_t<decltype(impl::get_allocator(ctx_))>;
+    using allocator_type = std::decay_t<decltype(asio::get_associated_allocator(get_handler(ctx_)))>;
 
     allocator_type get_allocator() const noexcept {
-        return impl::get_allocator(ctx_);
+        return asio::get_associated_allocator(get_handler(ctx_));
     }
 };
 
-template <typename Context, typename BinaryQuery>
-inline auto make_async_send_query_params_op(Context&& ctx, BinaryQuery&& q) {
-    return async_send_query_params_op<std::decay_t<Context>, std::decay_t<BinaryQuery>> {
-        std::forward<Context>(ctx), std::forward<BinaryQuery>(q)
-    };
-}
-
-template <typename T, typename ...Ts>
-inline decltype(auto) make_binary_query(const query_builder<Ts...>& builder, const oid_map_t<T>& m) {
-    return make_binary_query(builder.build(), m);
+template <typename T, typename Allocator, typename ...Ts>
+inline decltype(auto) make_binary_query(const query_builder<Ts...>& builder, const oid_map_t<T>& m, Allocator a) {
+    return make_binary_query(builder.build(), m, a);
 }
 
 template <typename Context, typename Query>
 void async_send_query_params(std::shared_ptr<Context> ctx, Query&& query) {
     auto q = make_binary_query(std::forward<Query>(query),
-                        get_oid_map(get_connection(ctx)));
+                        get_oid_map(get_connection(ctx)),
+                        asio::get_associated_allocator(get_handler(ctx)));
 
-    make_async_send_query_params_op(std::move(ctx), std::move(q)).perform();
+    async_send_query_params_op op{std::move(ctx), std::move(q)};
+    op.perform();
 }
 
 #include <boost/asio/yield.hpp>
@@ -212,7 +185,7 @@ struct async_get_result_op : boost::asio::coroutine {
     : ctx_(ctx), process_(process) {}
 
     void perform() {
-        post(ctx_, *this);
+        (*this)();
     }
 
     void done() {
@@ -314,35 +287,25 @@ struct async_get_result_op : boost::asio::coroutine {
         done();
     }
 
-    using executor_type = std::decay_t<decltype(impl::get_executor(ctx_))>;
+    using executor_type = std::decay_t<decltype(asio::get_associated_executor(get_handler(ctx_)))>;
 
     executor_type get_executor() const noexcept {
-        return impl::get_executor(ctx_);
+        return asio::get_associated_executor(get_handler(ctx_));
     }
 
-    using allocator_type = std::decay_t<decltype(impl::get_allocator(ctx_))>;
+    using allocator_type = std::decay_t<decltype(asio::get_associated_allocator(get_handler(ctx_)))>;
 
     allocator_type get_allocator() const noexcept {
-        return impl::get_allocator(ctx_);
+        return asio::get_associated_allocator(get_handler(ctx_));
     }
 };
 
 #include <boost/asio/unyield.hpp>
 
 template <typename Context, typename ResultProcessor>
-inline auto make_async_get_result_op(Context&& ctx, ResultProcessor&& process) {
-    return async_get_result_op<std::decay_t<Context>, std::decay_t<ResultProcessor>>{
-        std::forward<Context>(ctx),
-        std::forward<ResultProcessor>(process)
-    };
-}
-
-template <typename Context, typename ResultProcessor>
-inline void async_get_result(Context&& ctx, ResultProcessor&& process) {
-    make_async_get_result_op(
-        std::forward<Context>(ctx),
-        std::forward<ResultProcessor>(process)
-    ).perform();
+inline void async_get_result(Context&& ctx, ResultProcessor&& p) {
+    async_get_result_op op{std::forward<Context>(ctx), std::forward<ResultProcessor>(p)};
+    op.perform();
 }
 
 template <typename OutHandler, typename Query, typename Handler>
@@ -352,13 +315,16 @@ struct async_request_op {
     time_traits::duration timeout_;
     Handler handler_;
 
+    async_request_op(Query query, time_traits::duration timeout, OutHandler out, Handler handler)
+    : out_(std::move(out)), query_(std::move(query)), timeout_(timeout), handler_(std::move(handler)) {}
+
     template <typename Connection>
     void operator() (error_code ec, Connection conn) {
         if (ec) {
             return handler_(ec, std::move(conn));
         }
 
-        auto strand = ozo::detail::make_strand_executor(get_executor(conn));
+        auto strand = ozo::detail::make_strand_executor(ozo::get_executor(conn));
 
         auto ctx = make_request_operation_context(
             std::move(conn),
@@ -370,6 +336,18 @@ struct async_request_op {
 
         async_send_query_params(ctx, std::move(query_));
         async_get_result(std::move(ctx), std::move(out_));
+    }
+
+    using executor_type = std::decay_t<decltype(asio::get_associated_executor(handler_))>;
+
+    executor_type get_executor() const noexcept {
+        return asio::get_associated_executor(handler_);
+    }
+
+    using allocator_type = std::decay_t<decltype(asio::get_associated_allocator(handler_))>;
+
+    allocator_type get_allocator() const noexcept {
+        return asio::get_associated_allocator(handler_);
     }
 };
 
@@ -386,32 +364,17 @@ struct async_request_out_handler {
     }
 };
 
-template <typename Query, typename OutHandler, typename Handler>
-inline auto make_async_request_op(Query&& query, const time_traits::duration& timeout, OutHandler&& out, Handler&& handler) {
-    using result_type = impl::async_request_op<
-        std::decay_t<OutHandler>,
-        std::decay_t<Query>,
-        std::decay_t<Handler>
-    >;
-    return result_type {
-        std::forward<OutHandler>(out),
-        std::forward<Query>(query),
-        timeout,
-        std::forward<Handler>(handler)
-    };
-}
-
 template <typename P, typename Q, typename Out, typename Handler>
 inline void async_request(P&& provider, Q&& query, const time_traits::duration& timeout, Out&& out, Handler&& handler) {
     static_assert(ConnectionProvider<P>, "is not a ConnectionProvider");
     static_assert(Query<Q> || QueryBuilder<Q>, "is neither Query nor QueryBuilder");
     async_get_connection(std::forward<P>(provider),
-        make_async_request_op(
+        async_request_op{
             std::forward<Q>(query),
             timeout,
             async_request_out_handler{std::forward<Out>(out)},
             std::forward<Handler>(handler)
-        )
+        }
     );
 }
 
